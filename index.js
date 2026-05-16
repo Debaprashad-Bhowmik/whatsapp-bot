@@ -18,6 +18,7 @@ app.use(express.static(path.join(__dirname, 'public'))); // Serve the frontend d
 let botStatus = { state: 'STARTING', qrImage: null };
 let currentCronTask = null;
 let globalSock = null;
+let isReconnecting = false;
 
 // Database Schema for Bot Configuration
 const ConfigSchema = new mongoose.Schema({
@@ -165,6 +166,12 @@ mongoose.connect(process.env.MONGODB_URI).then(async () => {
     const { state, saveCreds } = await useMongoDBAuthState(AuthCollection);
 
     async function startBot() {
+        if (isReconnecting) {
+            console.log('⚠️ startBot called but already reconnecting/connecting. Ignoring.');
+            return;
+        }
+        isReconnecting = true;
+
         console.log('Initializing Baileys WhatsApp Client...');
         botStatus.state = 'STARTING';
         
@@ -190,6 +197,7 @@ mongoose.connect(process.env.MONGODB_URI).then(async () => {
             }
 
             if (connection === 'close') {
+                isReconnecting = false;
                 const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
                 console.log('❌ Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
                 
@@ -203,6 +211,7 @@ mongoose.connect(process.env.MONGODB_URI).then(async () => {
                     process.exit(0);
                 }
             } else if (connection === 'open') {
+                isReconnecting = false;
                 console.log('✅ Client is ready! Bot is now connected.');
                 botStatus.state = 'CONNECTED';
                 botStatus.qrImage = null; // Clear QR code from memory
