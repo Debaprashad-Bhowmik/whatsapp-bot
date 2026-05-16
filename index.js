@@ -5,28 +5,70 @@ const qrcode = require('qrcode');
 const cron = require('node-cron');
 const mongoose = require('mongoose');
 const express = require('express');
+const path = require('path');
 
-// Express server to display QR code and keep Render awake
+// Express server
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-let webpageContent = `
-    <div style="font-family: sans-serif; text-align: center; margin-top: 50px;">
-        <h2>Bot is starting...</h2>
-        <p>Please refresh this page in a few seconds to see the QR code.</p>
-    </div>
-`;
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public'))); // Serve the frontend dashboard
 
-app.get('/', (req, res) => {
-    res.send(webpageContent);
+// Global States
+let botStatus = { state: 'STARTING', qrImage: null };
+let currentCronTask = null;
+let globalSock = null;
+
+// Database Schema for Bot Configuration
+const ConfigSchema = new mongoose.Schema({
+    _id: { type: String, default: 'global' },
+    targetNumber: { type: String, default: '8801847101102@s.whatsapp.net' },
+    message: { type: String, default: 'valo achi' },
+    intervalHours: { type: Number, default: 8 },
+    isActive: { type: Boolean, default: true }
+});
+const ConfigModel = mongoose.model('BotConfig', ConfigSchema);
+
+// API Endpoints for Frontend Dashboard
+app.get('/api/status', (req, res) => {
+    res.json(botStatus);
+});
+
+app.get('/api/config', async (req, res) => {
+    let config = await ConfigModel.findById('global');
+    if (!config) {
+        config = { targetNumber: '8801847101102@s.whatsapp.net', message: 'valo achi', intervalHours: 8, isActive: true };
+    }
+    res.json(config);
+});
+
+app.post('/api/config', async (req, res) => {
+    try {
+        let target = req.body.targetNumber;
+        if (!target.includes('@')) target += '@s.whatsapp.net';
+        
+        const newConfig = {
+            _id: 'global',
+            targetNumber: target,
+            message: req.body.message,
+            intervalHours: req.body.intervalHours,
+            isActive: req.body.isActive
+        };
+        
+        await ConfigModel.replaceOne({ _id: 'global' }, newConfig, { upsert: true });
+        
+        // Refresh the cron job immediately with new settings
+        await setupCron();
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Failed to save config:', err);
+        res.status(500).json({ error: 'Failed to save config' });
+    }
 });
 
 app.listen(PORT, () => {
-    console.log(`🌍 Web server listening on port ${PORT}`);
+    console.log(`🌍 Web server and API listening on port ${PORT}`);
 });
-
-// Target phone number formatted for Baileys
-const TARGET_NUMBER = '8801847101102@s.whatsapp.net';
 
 console.log('Connecting to MongoDB Atlas...');
 
@@ -84,10 +126,39 @@ const useMongoDBAuthState = async (collection) => {
     };
 };
 
+async function setupCron() {
+    if (currentCronTask) {
+        currentCronTask.stop();
+        console.log('🛑 Stopped existing cron schedule.');
+    }
+
+    let config = await ConfigModel.findById('global');
+    if (!config) {
+        // Fallback default
+        config = { targetNumber: '8801847101102@s.whatsapp.net', message: 'valo achi', intervalHours: 8, isActive: true };
+    }
+
+    if (config.isActive) {
+        console.log(`⏳ Setting up schedule to send "${config.message}" to ${config.targetNumber} every ${config.intervalHours} hours...`);
+        // Cron expression for every X hours
+        currentCronTask = cron.schedule(`0 */${config.intervalHours} * * *`, async () => {
+            if (!globalSock) return;
+            try {
+                console.log(`[${new Date().toLocaleString()}] Sending scheduled message...`);
+                await globalSock.sendMessage(config.targetNumber, { text: config.message });
+                console.log(`[${new Date().toLocaleString()}] ✅ Scheduled message sent!`);
+            } catch (err) {
+                console.error(`[${new Date().toLocaleString()}] ❌ Failed to send scheduled message:`, err);
+            }
+        });
+    } else {
+        console.log('⏸️ Bot automated messaging is currently set to OFF in the dashboard.');
+    }
+}
+
 mongoose.connect(process.env.MONGODB_URI).then(async () => {
     console.log('✅ Connected to MongoDB!');
     
-    // Create a generic schema/model for the auth state
     const AuthSchema = new mongoose.Schema({ _id: String }, { strict: false });
     const AuthCollection = mongoose.model('BaileysAuth', AuthSchema);
     
@@ -95,29 +166,24 @@ mongoose.connect(process.env.MONGODB_URI).then(async () => {
 
     async function startBot() {
         console.log('Initializing Baileys WhatsApp Client...');
+        botStatus.state = 'STARTING';
         
-        const sock = makeWASocket({
+        globalSock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
-            logger: pino({ level: 'silent' }) // Disable noisy logs
+            logger: pino({ level: 'silent' })
         });
 
-        sock.ev.on('creds.update', saveCreds);
+        globalSock.ev.on('creds.update', saveCreds);
 
-        sock.ev.on('connection.update', async (update) => {
+        globalSock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
-                console.log('📱 QR Code generated! Check the web page to scan it.');
+                console.log('📱 QR Code generated! Check the dashboard to scan it.');
                 try {
-                    const qrImage = await qrcode.toDataURL(qr);
-                    webpageContent = `
-                        <div style="font-family: sans-serif; text-align: center; margin-top: 50px;">
-                            <h2>Scan this QR code with your WhatsApp</h2>
-                            <p>Go to Settings > Linked Devices > Link a Device</p>
-                            <img src="${qrImage}" alt="QR Code" style="width: 300px; height: 300px; border: 1px solid #ccc; padding: 10px; border-radius: 10px;"/>
-                        </div>
-                    `;
+                    botStatus.qrImage = await qrcode.toDataURL(qr);
+                    botStatus.state = 'QR';
                 } catch (err) {
                     console.error('Failed to generate QR image:', err);
                 }
@@ -125,45 +191,24 @@ mongoose.connect(process.env.MONGODB_URI).then(async () => {
 
             if (connection === 'close') {
                 const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log('❌ Connection closed due to ', lastDisconnect.error, ', reconnecting ', shouldReconnect);
+                console.log('❌ Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
                 
-                webpageContent = `
-                    <div style="font-family: sans-serif; text-align: center; margin-top: 50px; color: red;">
-                        <h2>❌ WhatsApp Bot was disconnected.</h2>
-                        <p>Server restarting...</p>
-                    </div>
-                `;
+                botStatus.state = 'DISCONNECTED';
 
                 if (shouldReconnect) {
-                    startBot();
+                    setTimeout(startBot, 5000); // Wait 5s before reconnect
                 } else {
                     console.log('Logged out. Please restart server to get new QR code.');
-                    // If logged out, delete auth state
                     await AuthCollection.deleteMany({});
                     process.exit(0);
                 }
             } else if (connection === 'open') {
                 console.log('✅ Client is ready! Bot is now connected.');
-                webpageContent = `
-                    <div style="font-family: sans-serif; text-align: center; margin-top: 50px; color: green;">
-                        <h2>✅ WhatsApp Bot is Alive and Connected!</h2>
-                        <p>The session is securely saved in MongoDB.</p>
-                    </div>
-                `;
-            }
-        });
-
-        // Clear existing cron jobs if reconnecting
-        cron.getTasks().forEach(task => task.stop());
-
-        console.log('⏳ Setting up schedule to send "valo achi" every 8 hours...');
-        cron.schedule('0 */8 * * *', async () => {
-            try {
-                console.log(`[${new Date().toLocaleString()}] Sending scheduled message...`);
-                await sock.sendMessage(TARGET_NUMBER, { text: 'valo achi' });
-                console.log(`[${new Date().toLocaleString()}] ✅ Scheduled message sent!`);
-            } catch (err) {
-                console.error(`[${new Date().toLocaleString()}] ❌ Failed to send scheduled message:`, err);
+                botStatus.state = 'CONNECTED';
+                botStatus.qrImage = null; // Clear QR code from memory
+                
+                // Initialize the cron schedule based on MongoDB settings
+                setupCron();
             }
         });
     }
