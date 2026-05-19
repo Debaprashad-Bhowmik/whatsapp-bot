@@ -5,12 +5,6 @@ document.addEventListener('DOMContentLoaded', () => {
     // Poll status every 3 seconds
     setInterval(fetchStatus, 3000);
 
-    const messageCountInput = document.getElementById('messageCount');
-    messageCountInput.addEventListener('input', (e) => {
-        const count = parseInt(e.target.value) || 1;
-        renderMessageBoxes(count);
-    });
-
     const form = document.getElementById('config-form');
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
@@ -20,28 +14,10 @@ document.addEventListener('DOMContentLoaded', () => {
         saveBtn.innerHTML = 'Saving...';
         saveBtn.style.opacity = '0.8';
 
-        // Gather all message box values
-        const messages = [];
-        const count = parseInt(document.getElementById('messageCount').value) || 1;
-        for (let i = 0; i < count; i++) {
-            const el = document.getElementById(`message-${i}`);
-            if (el && el.value.trim() !== '') {
-                messages.push(el.value.trim());
-            }
-        }
-        
-        if (messages.length === 0) {
-            alert('Please enter at least one message.');
-            saveBtn.innerHTML = originalText;
-            saveBtn.style.opacity = '1';
-            return;
-        }
-
         const config = {
             targetNumber: document.getElementById('targetNumber').value,
-            messages: messages,
-            intervalValue: parseFloat(document.getElementById('intervalValue').value),
-            intervalUnit: document.getElementById('intervalUnit').value,
+            message: document.getElementById('message').value,
+            intervalHours: parseInt(document.getElementById('intervalHours').value),
             isActive: document.getElementById('isActive').checked
         };
 
@@ -123,53 +99,11 @@ async function fetchConfig() {
             }
             
             document.getElementById('targetNumber').value = num;
-            document.getElementById('intervalValue').value = data.intervalValue || 8;
-            document.getElementById('intervalUnit').value = data.intervalUnit || 'Hours';
+            document.getElementById('message').value = data.message || '';
+            document.getElementById('intervalHours').value = data.intervalHours || 8;
             document.getElementById('isActive').checked = data.isActive !== false; // default true
-            
-            const msgs = data.messages && data.messages.length > 0 ? data.messages : [''];
-            document.getElementById('messageCount').value = msgs.length;
-            renderMessageBoxes(msgs.length, msgs);
         }
     } catch (err) {
         console.error('Config fetch failed', err);
-    }
-}
-
-function renderMessageBoxes(count, existingMessages = []) {
-    const container = document.getElementById('messageBoxesContainer');
-    
-    // Save existing values to prevent losing data when changing count
-    const currentValues = [];
-    for (let i = 0; i < container.children.length; i++) {
-        const el = document.getElementById(`message-${i}`);
-        if (el) currentValues.push(el.value);
-    }
-
-    container.innerHTML = '';
-    
-    for (let i = 0; i < count; i++) {
-        const div = document.createElement('div');
-        div.className = 'form-group';
-        
-        const label = document.createElement('label');
-        label.setAttribute('for', `message-${i}`);
-        label.innerText = `Message ${i + 1}`;
-        
-        const textarea = document.createElement('textarea');
-        textarea.id = `message-${i}`;
-        textarea.rows = 2;
-        textarea.placeholder = `Type message ${i + 1} here...`;
-        textarea.required = true;
-        
-        if (existingMessages[i] !== undefined) {
-            textarea.value = existingMessages[i];
-        } else if (currentValues[i] !== undefined) {
-            textarea.value = currentValues[i];
-        }
-        
-        div.appendChild(label);
-        div.appendChild(textarea);
-        container.appendChild(div);
     }
 }

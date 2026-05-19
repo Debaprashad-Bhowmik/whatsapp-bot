@@ -16,8 +16,7 @@ app.use(express.static(path.join(__dirname, 'public'))); // Serve the frontend d
 
 // Global States
 let botStatus = { state: 'STARTING', qrImage: null };
-let currentIntervalTimer = null;
-let currentMessageIndex = 0;
+let currentCronTask = null;
 let globalSock = null;
 let isReconnecting = false;
 
@@ -25,9 +24,8 @@ let isReconnecting = false;
 const ConfigSchema = new mongoose.Schema({
     _id: { type: String, default: 'global' },
     targetNumber: { type: String, default: '8801847101102@s.whatsapp.net' },
-    messages: { type: [String], default: ['valo achi'] },
-    intervalValue: { type: Number, default: 8 },
-    intervalUnit: { type: String, default: 'Hours' },
+    message: { type: String, default: 'valo achi' },
+    intervalHours: { type: Number, default: 8 },
     isActive: { type: Boolean, default: true }
 });
 const ConfigModel = mongoose.model('BotConfig', ConfigSchema);
@@ -40,7 +38,7 @@ app.get('/api/status', (req, res) => {
 app.get('/api/config', async (req, res) => {
     let config = await ConfigModel.findById('global');
     if (!config) {
-        config = { targetNumber: '8801847101102@s.whatsapp.net', messages: ['valo achi'], intervalValue: 8, intervalUnit: 'Hours', isActive: true };
+        config = { targetNumber: '8801847101102@s.whatsapp.net', message: 'valo achi', intervalHours: 8, isActive: true };
     }
     res.json(config);
 });
@@ -53,15 +51,14 @@ app.post('/api/config', async (req, res) => {
         const newConfig = {
             _id: 'global',
             targetNumber: target,
-            messages: req.body.messages || ['valo achi'],
-            intervalValue: req.body.intervalValue || 8,
-            intervalUnit: req.body.intervalUnit || 'Hours',
+            message: req.body.message,
+            intervalHours: req.body.intervalHours,
             isActive: req.body.isActive
         };
         
         await ConfigModel.replaceOne({ _id: 'global' }, newConfig, { upsert: true });
         
-        // Refresh the schedule immediately with new settings
+        // Refresh the cron job immediately with new settings
         await setupCron();
         res.json({ success: true });
     } catch (err) {
@@ -131,44 +128,32 @@ const useMongoDBAuthState = async (collection) => {
 };
 
 async function setupCron() {
-    if (currentIntervalTimer) {
-        clearInterval(currentIntervalTimer);
-        console.log('🛑 Stopped existing schedule.');
+    if (currentCronTask) {
+        currentCronTask.stop();
+        console.log('🛑 Stopped existing cron schedule.');
     }
 
     let config = await ConfigModel.findById('global');
     if (!config) {
         // Fallback default
-        config = { targetNumber: '8801847101102@s.whatsapp.net', messages: ['valo achi'], intervalValue: 8, intervalUnit: 'Hours', isActive: true };
+        config = { targetNumber: '8801847101102@s.whatsapp.net', message: 'valo achi', intervalHours: 8, isActive: true };
     }
 
-    if (config.isActive && config.messages && config.messages.length > 0) {
-        console.log(`⏳ Setting up schedule to send ${config.messages.length} messages to ${config.targetNumber} every ${config.intervalValue} ${config.intervalUnit}...`);
-        
-        // Calculate interval in milliseconds
-        let intervalMs = config.intervalValue * 1000; // default Seconds
-        if (config.intervalUnit === 'Minutes') intervalMs *= 60;
-        if (config.intervalUnit === 'Hours') intervalMs *= 3600;
-        
-        // Ensure minimum interval of 0.5s to prevent freezing the bot
-        if (intervalMs < 500) intervalMs = 500;
-
-        currentMessageIndex = 0; // reset index when settings change
-
-        currentIntervalTimer = setInterval(async () => {
+    if (config.isActive) {
+        console.log(`⏳ Setting up schedule to send "${config.message}" to ${config.targetNumber} every ${config.intervalHours} hours...`);
+        // Cron expression for every X hours
+        currentCronTask = cron.schedule(`0 */${config.intervalHours} * * *`, async () => {
             if (!globalSock) return;
             try {
-                const msgToSend = config.messages[currentMessageIndex % config.messages.length];
-                console.log(`[${new Date().toLocaleString()}] Sending scheduled message (${(currentMessageIndex % config.messages.length) + 1}/${config.messages.length})...`);
-                await globalSock.sendMessage(config.targetNumber, { text: msgToSend });
+                console.log(`[${new Date().toLocaleString()}] Sending scheduled message...`);
+                await globalSock.sendMessage(config.targetNumber, { text: config.message });
                 console.log(`[${new Date().toLocaleString()}] ✅ Scheduled message sent!`);
-                currentMessageIndex++;
             } catch (err) {
                 console.error(`[${new Date().toLocaleString()}] ❌ Failed to send scheduled message:`, err);
             }
-        }, intervalMs);
+        });
     } else {
-        console.log('⏸️ Bot automated messaging is currently set to OFF or no messages configured.');
+        console.log('⏸️ Bot automated messaging is currently set to OFF in the dashboard.');
     }
 }
 
@@ -177,6 +162,8 @@ mongoose.connect(process.env.MONGODB_URI).then(async () => {
     
     const AuthSchema = new mongoose.Schema({ _id: String }, { strict: false });
     const AuthCollection = mongoose.model('BaileysAuth', AuthSchema);
+    
+    const { state, saveCreds } = await useMongoDBAuthState(AuthCollection);
 
     async function startBot() {
         if (isReconnecting) {
@@ -188,9 +175,6 @@ mongoose.connect(process.env.MONGODB_URI).then(async () => {
         console.log('Initializing Baileys WhatsApp Client...');
         botStatus.state = 'STARTING';
         
-        // Fetch fresh auth state from DB every time we start/restart the bot
-        const { state, saveCreds } = await useMongoDBAuthState(AuthCollection);
-
         globalSock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
@@ -214,24 +198,17 @@ mongoose.connect(process.env.MONGODB_URI).then(async () => {
 
             if (connection === 'close') {
                 isReconnecting = false;
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                
-                // 401 is Logged Out, 440 is Conflict (another instance running with same session)
-                // 405 is Not Authorized. For all these, we should require re-authentication.
-                const requireReAuth = statusCode === DisconnectReason.loggedOut || statusCode === 440 || statusCode === 405;
-                const shouldReconnect = !requireReAuth;
-                
-                console.log('❌ Connection closed due to ', lastDisconnect?.error?.message || lastDisconnect?.error, ', reconnecting:', shouldReconnect);
+                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+                console.log('❌ Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
                 
                 botStatus.state = 'DISCONNECTED';
 
                 if (shouldReconnect) {
                     setTimeout(startBot, 5000); // Wait 5s before reconnect
                 } else {
-                    console.log('Session invalidated (logged out or conflict). Clearing credentials to get new QR code...');
-                    botStatus.state = 'STARTING'; // Reset state so frontend knows we are restarting
+                    console.log('Logged out. Please restart server to get new QR code.');
                     await AuthCollection.deleteMany({});
-                    setTimeout(startBot, 2000); // Restart bot to generate fresh QR
+                    process.exit(0);
                 }
             } else if (connection === 'open') {
                 isReconnecting = false;
